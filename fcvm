@@ -1,0 +1,521 @@
+#!/usr/bin/env bash
+#
+# fcvm — end-to-end driver for running an Alpine Linux microVM on Firecracker.
+#
+# Subcommands (run `./fcvm help` for details):
+#   setup   download the Firecracker binary + guest kernel
+#   build   build the Alpine rootfs ext4 image (rootless, via apk.static+fakeroot)
+#   net     up|down  create/destroy the host tap device + NAT (needs sudo)
+#   run     boot the microVM and attach to its serial console
+#   ssh     ssh into a running guest
+#   up      one-shot: setup + build + net up + run
+#   status  show what exists and whether the network is configured
+#   clean   remove build artifacts (add --all to also drop downloads)
+#
+set -euo pipefail
+
+# --- locate ourselves & load config ----------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR/build"
+# shellcheck source=/dev/null
+[ -f "$SCRIPT_DIR/config.env" ] && source "$SCRIPT_DIR/config.env"
+
+ARCH="$(uname -m)"
+DISTRO="${DISTRO:-alpine}"          # alpine | ubuntu
+UBUNTU_RELEASE="${UBUNTU_RELEASE:-24.04}"
+
+# artifact paths
+FC_BIN="$BUILD_DIR/firecracker"
+KERNEL="$BUILD_DIR/vmlinux"
+ROOTFS="$BUILD_DIR/${DISTRO}.ext4"   # per-distro, so both can coexist
+APK_STATIC="$BUILD_DIR/apk.static"
+UBUNTU_SQUASHFS="$BUILD_DIR/ubuntu-${UBUNTU_RELEASE}.squashfs"
+VM_CONFIG="$BUILD_DIR/vm-config.json"
+FC_SOCK="$BUILD_DIR/firecracker.sock"
+STAGING="$BUILD_DIR/rootfs"
+FAKEROOT_STATE="$BUILD_DIR/.fakeroot.state"
+
+# --- pretty logging ---------------------------------------------------------
+if [ -t 2 ]; then C_B="\033[1m"; C_G="\033[32m"; C_Y="\033[33m"; C_R="\033[31m"; C_0="\033[0m"; else C_B=; C_G=; C_Y=; C_R=; C_0=; fi
+info() { printf "${C_G}==>${C_0} ${C_B}%s${C_0}\n" "$*" >&2; }
+step() { printf "${C_G}  ->${C_0} %s\n" "$*" >&2; }
+warn() { printf "${C_Y}warn:${C_0} %s\n" "$*" >&2; }
+die()  { printf "${C_R}error:${C_0} %s\n" "$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+
+# Run a command as root (no-op if already root, else via sudo).
+as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+
+# =====================================================================
+# setup — fetch the Firecracker binary and the guest kernel
+# =====================================================================
+cmd_setup() {
+  need curl; need tar
+  mkdir -p "$BUILD_DIR"
+
+  # ---- Firecracker binary ----
+  local ver="${FC_VERSION:-}"
+  if [ -z "$ver" ]; then
+    step "detecting latest Firecracker release"
+    ver="$(basename "$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+      https://github.com/firecracker-microvm/firecracker/releases/latest)")"
+  fi
+  if [ -x "$FC_BIN" ] && "$FC_BIN" --version 2>/dev/null | grep -q "$ver"; then
+    step "firecracker $ver already present"
+  else
+    info "downloading Firecracker $ver ($ARCH)"
+    local tgz="$BUILD_DIR/firecracker.tgz"
+    curl -fL# -o "$tgz" \
+      "https://github.com/firecracker-microvm/firecracker/releases/download/${ver}/firecracker-${ver}-${ARCH}.tgz"
+    tar -xzf "$tgz" -C "$BUILD_DIR"
+    local bin
+    bin="$(find "$BUILD_DIR" -type f -name "firecracker-${ver}-${ARCH}" | head -1)"
+    [ -n "$bin" ] || die "could not find firecracker binary inside the archive"
+    install -m 0755 "$bin" "$FC_BIN"
+    rm -rf "$tgz" "$BUILD_DIR/release-${ver}-${ARCH}"
+    step "installed $("$FC_BIN" --version | head -1)"
+  fi
+
+  # ---- guest kernel (Firecracker CI microVM kernel) ----
+  if [ -f "$KERNEL" ]; then
+    step "kernel already present ($KERNEL)"
+  else
+    info "downloading guest kernel vmlinux-${KERNEL_VERSION}"
+    curl -fL# -o "$KERNEL" \
+      "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_CI_VERSION}/${ARCH}/vmlinux-${KERNEL_VERSION}"
+  fi
+  info "setup complete"
+}
+
+# =====================================================================
+# build — assemble the guest rootfs ext4 image (no root needed)
+#   DISTRO=alpine -> built from scratch with apk.static
+#   DISTRO=ubuntu -> Firecracker's official Ubuntu image, squashfs -> ext4
+# =====================================================================
+cmd_build() {
+  need curl; need fakeroot; need mkfs.ext4
+  mkdir -p "$BUILD_DIR"
+  case "$DISTRO" in
+    alpine) build_alpine ;;
+    ubuntu) build_ubuntu ;;
+    *) die "unknown DISTRO '$DISTRO' (use alpine or ubuntu)" ;;
+  esac
+}
+
+# Pack the staged tree into an ext4 image, reloading the faked ownership/modes.
+# $1 = filesystem label, $2 = size in MiB. Phase 2 (real chmod) runs first so
+# the packer can read files apk/unsquashfs left mode 0111; the faked metadata in
+# the state file is untouched by a real chmod.
+pack_rootfs() {
+  local label="$1" size="$2"
+  chmod -R u+rwX "$STAGING"
+  info "packing ext4 image (${size} MiB)"
+  rm -f "$ROOTFS"
+  fakeroot -i "$FAKEROOT_STATE" -- \
+    mkfs.ext4 -q -F -L "$label" -d "$STAGING" "$ROOTFS" "${size}M"
+  info "rootfs ready: $ROOTFS"
+}
+
+build_alpine() {
+  need tar
+  local repo="$ALPINE_MIRROR/$ALPINE_BRANCH"
+
+  # ---- get apk.static (statically-linked apk that runs on any host) ----
+  if [ ! -x "$APK_STATIC" ]; then
+    info "fetching apk.static from Alpine $ALPINE_BRANCH"
+    local apkfile
+    apkfile="$(curl -fsSL "$repo/main/$ARCH/" \
+      | grep -oE 'apk-tools-static-[0-9][^"]*\.apk' | sort -V | tail -1)"
+    [ -n "$apkfile" ] || die "could not locate apk-tools-static on the mirror"
+    curl -fL# -o "$BUILD_DIR/apk-static.apk" "$repo/main/$ARCH/$apkfile"
+    # .apk is a gzip-tar; the apk.static binary lives under sbin/
+    tar -xzf "$BUILD_DIR/apk-static.apk" -C "$BUILD_DIR" sbin/apk.static 2>/dev/null
+    install -m 0755 "$BUILD_DIR/sbin/apk.static" "$APK_STATIC"
+    rm -rf "$BUILD_DIR/sbin" "$BUILD_DIR/apk-static.apk"
+  fi
+
+  rm -rf "$STAGING" "$FAKEROOT_STATE"
+  mkdir -p "$STAGING"
+
+  # Phase 1: install + configure under a persistent fakeroot session. fakeroot
+  # makes apk believe it is root, so the tree gets root:root ownership recorded
+  # in $FAKEROOT_STATE. We re-invoke this script so all helpers are in scope.
+  info "installing Alpine packages into rootfs (rootless)"
+  ROOT_PASSWORD="$ROOT_PASSWORD" GUEST_HOSTNAME="$GUEST_HOSTNAME" \
+  GUEST_DNS="$GUEST_DNS" SSH_PUBKEY="$SSH_PUBKEY" \
+  STAGING="$STAGING" APK_STATIC="$APK_STATIC" REPO="$repo" ARCH="$ARCH" \
+  PKGS="alpine-base openrc openssh $ROOTFS_PACKAGES" \
+  fakeroot -s "$FAKEROOT_STATE" -- bash "$SCRIPT_DIR/fcvm" __alpine_inside
+
+  pack_rootfs alpine "$ROOTFS_SIZE_MIB"
+}
+
+build_ubuntu() {
+  need unsquashfs
+  # ---- download Firecracker's official Ubuntu image (cached) ----
+  if [ ! -f "$UBUNTU_SQUASHFS" ]; then
+    info "downloading Ubuntu $UBUNTU_RELEASE rootfs (squashfs)"
+    curl -fL# -o "$UBUNTU_SQUASHFS" \
+      "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_CI_VERSION}/${ARCH}/ubuntu-${UBUNTU_RELEASE}.squashfs"
+  fi
+
+  rm -rf "$STAGING" "$FAKEROOT_STATE"
+
+  # Phase 1: extract + configure under a persistent fakeroot session, so the
+  # tree keeps the image's original root:root ownership.
+  info "extracting + configuring Ubuntu rootfs (rootless)"
+  ROOT_PASSWORD="$ROOT_PASSWORD" GUEST_HOSTNAME="$GUEST_HOSTNAME" \
+  GUEST_DNS="$GUEST_DNS" SSH_PUBKEY="$SSH_PUBKEY" \
+  STAGING="$STAGING" SQUASHFS="$UBUNTU_SQUASHFS" \
+  fakeroot -s "$FAKEROOT_STATE" -- bash "$SCRIPT_DIR/fcvm" __ubuntu_inside
+
+  # Size the image from actual usage (Ubuntu is ~400 MiB), with slack.
+  local used size
+  used="$(du -sm "$STAGING" | cut -f1)"
+  size=$(( used + 512 ))
+  [ "$ROOTFS_SIZE_MIB" -gt "$size" ] && size="$ROOTFS_SIZE_MIB"
+  pack_rootfs ubuntu "$size"
+}
+
+# Shared guest config, applied with cwd == staging root, inside a fakeroot
+# session. Handles the bits both distros need: hostname, DNS, root password
+# (for ssh; the console is passwordless autologin), and the injected ssh key.
+configure_common() {
+  echo "$GUEST_HOSTNAME" > etc/hostname
+  cat > etc/hosts <<EOF
+127.0.0.1   localhost localhost.localdomain
+127.0.1.1   $GUEST_HOSTNAME
+::1         localhost ip6-localhost
+EOF
+  echo "nameserver $GUEST_DNS" > etc/resolv.conf
+
+  # Root password hash, computed on the host (the guest is offline at build).
+  if [ -f etc/shadow ] && command -v openssl >/dev/null 2>&1; then
+    local hash; hash="$(openssl passwd -6 "$ROOT_PASSWORD")"
+    awk -v h="$hash" 'BEGIN{FS=OFS=":"} $1=="root"{$2=h} {print}' etc/shadow > etc/shadow.new
+    mv etc/shadow.new etc/shadow
+  else
+    warn "could not set root password (no shadow file or no openssl); use ssh keys"
+  fi
+
+  # Optional ssh public key.
+  local pubkey="$SSH_PUBKEY"
+  if [ -z "$pubkey" ]; then
+    pubkey="$(ls "$HOME"/.ssh/id_*.pub 2>/dev/null | grep -v -- '-cert.pub' | head -1 || true)"
+  fi
+  if [ -n "$pubkey" ] && [ -f "$pubkey" ]; then
+    mkdir -p root/.ssh && chmod 700 root/.ssh
+    cat "$pubkey" >> root/.ssh/authorized_keys
+    chmod 600 root/.ssh/authorized_keys
+    step "injected ssh key: $(basename "$pubkey")"
+  fi
+}
+
+# Internal: runs inside the fakeroot session from build_alpine. Not for direct use.
+alpine_build_inside() {
+  set -euo pipefail
+  cd "$STAGING"
+
+  step "apk add: $PKGS"
+  "$APK_STATIC" -X "$REPO/main" -X "$REPO/community" \
+    -U --allow-untrusted --usermode --root "$STAGING" --arch "$ARCH" --initdb \
+    add $PKGS >/dev/null
+
+  step "configuring Alpine guest (init, network, ssh, accounts)"
+  mkdir -p etc/runlevels/sysinit etc/runlevels/boot \
+           etc/runlevels/default etc/runlevels/shutdown
+
+  # Serial console: autologin root on ttyS0; drop the tty1..6 gettys (no VGA).
+  cat > etc/inittab <<'EOF'
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+ttyS0::respawn:/bin/login -f root
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown
+EOF
+
+  # Enable the services needed for a clean, networked boot.
+  local svc
+  for svc in devfs dmesg;                                 do ln -sf "/etc/init.d/$svc" "etc/runlevels/sysinit/$svc"; done
+  for svc in bootmisc hostname sysctl modules seedrng syslog; do ln -sf "/etc/init.d/$svc" "etc/runlevels/boot/$svc"; done
+  for svc in sshd local;                                  do ln -sf "/etc/init.d/$svc" "etc/runlevels/default/$svc"; done
+  for svc in killprocs mount-ro savecache;                do ln -sf "/etc/init.d/$svc" "etc/runlevels/shutdown/$svc"; done
+
+  cat > etc/fstab <<'EOF'
+/dev/vda  /  ext4  rw,relatime  0 1
+EOF
+  # eth0 is configured by the kernel `ip=` boot arg; this documents it and lets
+  # `ifup eth0` work if ifupdown-ng is installed later.
+  mkdir -p etc/network
+  cat > etc/network/interfaces <<'EOF'
+auto lo
+iface lo inet loopback
+
+# Address is set at boot by the kernel `ip=` cmdline (see ./fcvm run).
+auto eth0
+iface eth0 inet manual
+EOF
+
+  configure_common
+
+  # Allow root ssh login (busybox/openssh sshd_config).
+  if [ -f etc/ssh/sshd_config ]; then
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' etc/ssh/sshd_config
+    grep -q '^PermitRootLogin yes' etc/ssh/sshd_config || echo 'PermitRootLogin yes' >> etc/ssh/sshd_config
+  fi
+}
+
+# Internal: runs inside the fakeroot session from build_ubuntu. Not for direct use.
+ubuntu_build_inside() {
+  set -euo pipefail
+  step "unsquashfs Ubuntu image"
+  unsquashfs -f -d "$STAGING" "$SQUASHFS" >/dev/null
+  cd "$STAGING"
+
+  step "configuring Ubuntu guest (ssh, accounts, hostname)"
+  # The Firecracker image ships systemd + openssh-server. Its stock
+  # serial-getty override autologins via `agetty -o '-p -- \u'` (no -f), which
+  # only works while root has an empty password. We set a root password (for
+  # ssh), so replace the override with a true no-auth autologin (`--autologin`
+  # without -o makes agetty run `login -f root`).
+  mkdir -p etc/systemd/system/serial-getty@ttyS0.service.d
+  cat > etc/systemd/system/serial-getty@ttyS0.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %I dumb
+EOF
+
+  configure_common
+
+  # Enable sshd at boot and permit root login with the password/key we set.
+  mkdir -p etc/systemd/system/multi-user.target.wants
+  if [ -f usr/lib/systemd/system/ssh.service ]; then
+    ln -sf /usr/lib/systemd/system/ssh.service \
+           etc/systemd/system/multi-user.target.wants/ssh.service
+  fi
+  mkdir -p etc/ssh/sshd_config.d
+  cat > etc/ssh/sshd_config.d/60-fcvm.conf <<'EOF'
+PermitRootLogin yes
+PasswordAuthentication yes
+EOF
+}
+
+# =====================================================================
+# net — host-side tap device + NAT
+# =====================================================================
+cmd_net() {
+  need ip
+  local action="${1:-up}"
+  case "$action" in
+    up)   net_up ;;
+    down) net_down ;;
+    *)    die "usage: fcvm net up|down" ;;
+  esac
+}
+
+net_up() {
+  local me; me="$(id -un)"
+  info "configuring host network (tap $TAP_DEV, needs sudo)"
+  if ! ip link show "$TAP_DEV" >/dev/null 2>&1; then
+    as_root ip tuntap add dev "$TAP_DEV" mode tap user "$me"
+  fi
+  as_root ip addr replace "$HOST_IP/$(mask2cidr "$NETMASK")" dev "$TAP_DEV"
+  as_root ip link set "$TAP_DEV" up
+
+  # NAT so the guest reaches the internet (best-effort).
+  local uplink; uplink="$(ip route show default | awk '/default/{print $5; exit}')"
+  if [ -n "$uplink" ]; then
+    as_root sysctl -wq net.ipv4.ip_forward=1
+    if command -v iptables >/dev/null 2>&1; then
+      as_root iptables -t nat -C POSTROUTING -s "$GUEST_IP/32" -o "$uplink" -j MASQUERADE 2>/dev/null \
+        || as_root iptables -t nat -A POSTROUTING -s "$GUEST_IP/32" -o "$uplink" -j MASQUERADE
+      as_root iptables -C FORWARD -i "$TAP_DEV" -o "$uplink" -j ACCEPT 2>/dev/null \
+        || as_root iptables -A FORWARD -i "$TAP_DEV" -o "$uplink" -j ACCEPT
+      as_root iptables -C FORWARD -i "$uplink" -o "$TAP_DEV" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || as_root iptables -A FORWARD -i "$uplink" -o "$TAP_DEV" -m state --state RELATED,ESTABLISHED -j ACCEPT
+      step "NAT enabled via $uplink (iptables)"
+    else
+      warn "iptables not found; guest will have host connectivity but no internet"
+    fi
+  else
+    warn "no default route found; skipping NAT"
+  fi
+  info "guest will be reachable at $GUEST_IP (host $HOST_IP)"
+}
+
+net_down() {
+  info "tearing down host network"
+  local uplink; uplink="$(ip route show default | awk '/default/{print $5; exit}')"
+  if [ -n "$uplink" ] && command -v iptables >/dev/null 2>&1; then
+    as_root iptables -t nat -D POSTROUTING -s "$GUEST_IP/32" -o "$uplink" -j MASQUERADE 2>/dev/null || true
+    as_root iptables -D FORWARD -i "$TAP_DEV" -o "$uplink" -j ACCEPT 2>/dev/null || true
+    as_root iptables -D FORWARD -i "$uplink" -o "$TAP_DEV" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  fi
+  ip link show "$TAP_DEV" >/dev/null 2>&1 && as_root ip link del "$TAP_DEV" || true
+  step "removed $TAP_DEV"
+}
+
+# netmask dotted-quad -> CIDR prefix length
+mask2cidr() {
+  local m=$1 bits=0 oct
+  IFS=. read -r o1 o2 o3 o4 <<EOF
+$m
+EOF
+  for oct in "$o1" "$o2" "$o3" "$o4"; do
+    while [ "$oct" -gt 0 ]; do bits=$((bits + (oct & 1))); oct=$((oct >> 1)); done
+  done
+  echo "$bits"
+}
+
+# =====================================================================
+# run — generate the VM config and boot, attaching the serial console
+# =====================================================================
+cmd_run() {
+  local with_net=auto
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-net) with_net=no ;;
+      --net)    with_net=yes ;;
+      *) die "unknown run option: $1" ;;
+    esac; shift
+  done
+
+  [ -x "$FC_BIN" ] || die "firecracker missing — run: ./fcvm setup"
+  [ -f "$KERNEL" ] || die "kernel missing — run: ./fcvm setup"
+  [ -f "$ROOTFS" ] || die "rootfs missing — run: ./fcvm build"
+
+  # Decide networking: default to enabled iff the tap device exists.
+  if [ "$with_net" = auto ]; then
+    if ip link show "$TAP_DEV" >/dev/null 2>&1; then with_net=yes; else with_net=no; fi
+  fi
+  if [ "$with_net" = yes ] && ! ip link show "$TAP_DEV" >/dev/null 2>&1; then
+    die "tap $TAP_DEV not found — run: ./fcvm net up (or use --no-net)"
+  fi
+
+  # Console + arch-specific kernel args.
+  local console extra
+  case "$ARCH" in
+    x86_64)  console=ttyS0;   extra="pci=off i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd" ;;
+    aarch64) console=ttyAMA0; extra="" ;;
+    *) die "unsupported arch: $ARCH" ;;
+  esac
+  local boot_args="console=$console reboot=k panic=1 random.trust_cpu=on root=/dev/vda rw $extra"
+
+  local net_json=""
+  if [ "$with_net" = yes ]; then
+    # ip=<client>::<gw>:<mask>::<iface>:off  — kernel configures eth0 at boot.
+    boot_args="$boot_args ip=${GUEST_IP}::${HOST_IP}:${NETMASK}::eth0:off"
+    net_json=$(cat <<EOF
+,
+  "network-interfaces": [
+    { "iface_id": "eth0", "host_dev_name": "$TAP_DEV", "guest_mac": "$GUEST_MAC" }
+  ]
+EOF
+)
+  fi
+
+  cat > "$VM_CONFIG" <<EOF
+{
+  "boot-source": {
+    "kernel_image_path": "$KERNEL",
+    "boot_args": "$boot_args"
+  },
+  "drives": [
+    { "drive_id": "rootfs", "path_on_host": "$ROOTFS", "is_root_device": true, "is_read_only": false }
+  ],
+  "machine-config": { "vcpu_count": $VCPUS, "mem_size_mib": $MEM_MIB }$net_json
+}
+EOF
+
+  rm -f "$FC_SOCK"
+  info "booting microVM (${VCPUS} vCPU, ${MEM_MIB} MiB, net=$with_net)"
+  step "console attached — log in is automatic; type 'poweroff' to shut down"
+  echo >&2
+  # --no-api boots straight from the config file; serial console = this terminal.
+  exec "$FC_BIN" --no-api --config-file "$VM_CONFIG"
+}
+
+# =====================================================================
+# ssh / status / clean / up
+# =====================================================================
+cmd_ssh() {
+  need ssh
+  exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+       -o GlobalKnownHostsFile=/dev/null root@"$GUEST_IP" "$@"
+}
+
+cmd_status() {
+  printf "Distro      : %s\n" "$DISTRO$([ "$DISTRO" = ubuntu ] && echo " $UBUNTU_RELEASE" || echo " ($ALPINE_BRANCH)")"
+  printf "Firecracker : %s\n" "$([ -x "$FC_BIN" ] && "$FC_BIN" --version 2>/dev/null | head -1 || echo 'not installed (./fcvm setup)')"
+  printf "Kernel      : %s\n" "$([ -f "$KERNEL" ] && echo "$KERNEL" || echo 'missing (./fcvm setup)')"
+  printf "Rootfs      : %s\n" "$([ -f "$ROOTFS" ] && du -h "$ROOTFS" | cut -f1 | xargs -I{} echo "$ROOTFS ({})" || echo 'missing (./fcvm build)')"
+  printf "Tap %-7s : %s\n" "$TAP_DEV" "$(ip link show "$TAP_DEV" >/dev/null 2>&1 && echo "up — guest $GUEST_IP" || echo 'down (./fcvm net up)')"
+}
+
+cmd_clean() {
+  if [ "${1:-}" = "--all" ]; then
+    info "removing entire build/ directory"
+    rm -rf "$BUILD_DIR"
+  else
+    info "removing rootfs + VM state (keeping downloads)"
+    rm -rf "$ROOTFS" "$STAGING" "$VM_CONFIG" "$FC_SOCK" "$FAKEROOT_STATE"
+  fi
+}
+
+cmd_up() {
+  cmd_setup
+  [ -f "$ROOTFS" ] || cmd_build
+  net_up
+  cmd_run
+}
+
+usage() {
+  cat <<'EOF'
+fcvm — run an Alpine Linux or Ubuntu microVM on Firecracker
+
+USAGE
+  ./fcvm <command> [args]
+
+COMMANDS
+  setup            Download the Firecracker binary and guest kernel
+  build            Build the guest rootfs ext4 image (rootless)
+  net up|down      Create/destroy the host tap device + NAT (uses sudo)
+  run [--no-net]   Boot the VM and attach to its serial console
+  ssh [cmd...]     SSH into the running guest as root
+  up               One-shot: setup + build + net up + run
+  status           Show artifact / network state
+  clean [--all]    Remove rootfs+VM state (--all also removes downloads)
+  help             Show this help
+
+GUEST DISTRO (set DISTRO=alpine | ubuntu; default alpine)
+  ./fcvm up                       # Alpine (latest-stable)
+  DISTRO=ubuntu ./fcvm up         # Ubuntu 24.04
+The two rootfs images coexist (build/alpine.ext4, build/ubuntu.ext4); each
+command acts on whichever DISTRO is selected.
+
+QUICK START
+  ./fcvm up                # do everything and drop into the guest console
+  # ...or step by step:
+  ./fcvm setup && ./fcvm build && ./fcvm net up && ./fcvm run
+
+Configuration lives in ./config.env (distro, CPU, memory, version, networking).
+EOF
+}
+
+# --- dispatch ---------------------------------------------------------------
+case "${1:-help}" in
+  setup)         shift; cmd_setup "$@" ;;
+  build)         shift; cmd_build "$@" ;;
+  net)           shift; cmd_net "$@" ;;
+  run)           shift; cmd_run "$@" ;;
+  ssh)           shift; cmd_ssh "$@" ;;
+  up)            shift; cmd_up "$@" ;;
+  status)        shift; cmd_status "$@" ;;
+  clean)         shift; cmd_clean "$@" ;;
+  __alpine_inside) alpine_build_inside ;;   # internal (invoked under fakeroot)
+  __ubuntu_inside) ubuntu_build_inside ;;   # internal (invoked under fakeroot)
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

@@ -1,0 +1,22 @@
+# Build artifacts: downloaded binaries (firecracker, apk.static), guest kernel
+# (vmlinux), rootfs images (*.ext4, *.bkp), squashfs caches, the extracted
+# rootfs/ tree, fakeroot state, and per-run VM config. All regenerable via
+# `./fcvm setup && ./fcvm build` — treat as a disposable cache.
+/build/
+
+# Claude Code per-user local settings (machine-specific; not shared).
+.claude/settings.local.json
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
