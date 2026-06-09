@@ -75,7 +75,10 @@ Three concerns, each a `cmd_*` function in `fcvm`, all writing to `build/`:
      (floored at `ROOTFS_SIZE_MIB`).
 
    `configure_common` (shared) writes hostname/hosts/resolv.conf, the root
-   password hash (host `openssl passwd -6`), and the injected SSH pubkey. Then
+   password hash (host `openssl passwd -6`), and the SSH pubkey resolved by
+   `cmd_build` — an explicit `SSH_PUBKEY`, else a dedicated `build/fcvm_id_ed25519`
+   key-pair auto-generated on first build (`fcvm ssh` authenticates with the
+   private half via `-i`). Then
    per-distro: *Alpine* writes a minimal `/etc/inittab` autologin
    (`/bin/login -f root`), OpenRC runlevel symlinks, fstab, and `PermitRootLogin`
    via sed; *Ubuntu* enables `ssh.service`, drops a `PermitRootLogin yes`

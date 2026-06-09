@@ -96,6 +96,11 @@ cmd_setup() {
 cmd_build() {
   need curl; need fakeroot; need mkfs.ext4
   mkdir -p "$BUILD_DIR"
+  # Resolve the ssh key to bake in: an explicit SSH_PUBKEY wins; otherwise
+  # generate (once) a dedicated fcvm key-pair and inject its public half.
+  if [ -z "$SSH_PUBKEY" ] && ensure_ssh_key; then
+    SSH_PUBKEY="$SSH_KEY.pub"
+  fi
   case "$DISTRO" in
     alpine) build_alpine ;;
     ubuntu) build_ubuntu ;;
@@ -115,6 +120,21 @@ pack_rootfs() {
   fakeroot -i "$FAKEROOT_STATE" -- \
     mkfs.ext4 -q -F -L "$label" -d "$STAGING" "$ROOTFS" "${size}M"
   info "rootfs ready: $ROOTFS"
+}
+
+# Ensure a dedicated fcvm ssh key-pair exists on the host, generating it on
+# first use. The matching public key is baked into the guest by
+# configure_common, and `fcvm ssh` authenticates with the private key. Lives
+# under build/, so `clean --all` regenerates it. Returns non-zero (and skips,
+# leaving SSH_PUBKEY empty) if ssh-keygen is unavailable.
+ensure_ssh_key() {
+  command -v ssh-keygen >/dev/null 2>&1 \
+    || { warn "ssh-keygen not found; skipping ssh key generation"; return 1; }
+  if [ ! -f "$SSH_KEY" ] || [ ! -f "$SSH_KEY.pub" ]; then
+    info "generating ssh key-pair -> $SSH_KEY"
+    rm -f "$SSH_KEY" "$SSH_KEY.pub"
+    ssh-keygen -q -t ed25519 -N '' -C "fcvm@$GUEST_HOSTNAME" -f "$SSH_KEY"
+  fi
 }
 
 build_alpine() {
@@ -199,16 +219,13 @@ EOF
     warn "could not set root password (no shadow file or no openssl); use ssh keys"
   fi
 
-  # Optional ssh public key.
-  local pubkey="$SSH_PUBKEY"
-  if [ -z "$pubkey" ]; then
-    pubkey="$(ls "$HOME"/.ssh/id_*.pub 2>/dev/null | grep -v -- '-cert.pub' | head -1 || true)"
-  fi
-  if [ -n "$pubkey" ] && [ -f "$pubkey" ]; then
+  # SSH public key (resolved by cmd_build: an explicit SSH_PUBKEY, else the
+  # auto-generated fcvm key-pair). Baked into root's authorized_keys.
+  if [ -n "$SSH_PUBKEY" ] && [ -f "$SSH_PUBKEY" ]; then
     mkdir -p root/.ssh && chmod 700 root/.ssh
-    cat "$pubkey" >> root/.ssh/authorized_keys
+    cat "$SSH_PUBKEY" >> root/.ssh/authorized_keys
     chmod 600 root/.ssh/authorized_keys
-    step "injected ssh key: $(basename "$pubkey")"
+    step "injected ssh key: $(basename "$SSH_PUBKEY")"
   fi
 }
 
@@ -442,7 +459,11 @@ EOF
 # =====================================================================
 cmd_ssh() {
   need ssh
-  exec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  # Authenticate with the dedicated fcvm key if it was generated; otherwise fall
+  # back to the host's default ssh identity (e.g. when SSH_PUBKEY is overridden).
+  local id=()
+  [ -f "$SSH_KEY" ] && id=(-i "$SSH_KEY" -o IdentitiesOnly=yes)
+  exec ssh "${id[@]}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
        -o GlobalKnownHostsFile=/dev/null root@"$GUEST_IP" "$@"
 }
 
@@ -451,6 +472,7 @@ cmd_status() {
   printf "Firecracker : %s\n" "$([ -x "$FC_BIN" ] && "$FC_BIN" --version 2>/dev/null | head -1 || echo 'not installed (./fcvm setup)')"
   printf "Kernel      : %s\n" "$([ -f "$KERNEL" ] && echo "$KERNEL" || echo 'missing (./fcvm setup)')"
   printf "Rootfs      : %s\n" "$([ -f "$ROOTFS" ] && du -h "$ROOTFS" | cut -f1 | xargs -I{} echo "$ROOTFS ({})" || echo 'missing (./fcvm build)')"
+  printf "SSH key     : %s\n" "$([ -f "$SSH_KEY" ] && echo "$SSH_KEY" || echo "${SSH_PUBKEY:-none (generated at build)}")"
   printf "Tap %-7s : %s\n" "$TAP_DEV" "$(ip link show "$TAP_DEV" >/dev/null 2>&1 && echo "up — guest $GUEST_IP" || echo 'down (./fcvm net up)')"
 }
 
