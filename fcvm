@@ -219,7 +219,7 @@ alpine_build_inside() {
 
   step "apk add: $PKGS"
   "$APK_STATIC" -X "$REPO/main" -X "$REPO/community" \
-    -U --allow-untrusted --usermode --root "$STAGING" --arch "$ARCH" --initdb \
+    -U --allow-untrusted --root "$STAGING" --arch "$ARCH" --initdb \
     add $PKGS >/dev/null
 
   step "configuring Alpine guest (init, network, ssh, accounts)"
