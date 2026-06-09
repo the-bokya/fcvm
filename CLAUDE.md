@@ -91,6 +91,11 @@ Three concerns, each a `cmd_*` function in `fcvm`, all writing to `build/`:
    terminal. Guest networking is done entirely by the **kernel `ip=` cmdline**
    (`ip=GUEST::HOST:MASK::eth0:off`) — there is no in-guest DHCP/network
    service. The network NIC is only added if the host tap exists (or `--net`).
+   An optional **data disk** (`DATA_DISK`) is created/formatted on the host by
+   `ensure_data_disk` and attached as the second drive (`/dev/vdb`); rootfs stays
+   first so it remains `/dev/vda`. It is raw by default; `DATA_DISK_FORMAT=true`
+   ext4-formats it and `configure_common` adds an fstab entry so the guest
+   auto-mounts it at `DATA_DISK_MOUNT`.
 
 `cmd_net` is the only privileged piece: it creates a **persistent, user-owned**
 tap (`ip tuntap … user $USER`) so the unprivileged Firecracker process can open
@@ -116,6 +121,15 @@ this form preserves values exported from the parent process.
   overwrite the `serial-getty@ttyS0` override to `agetty --autologin root`
   (without `-o`), which runs `login -f root` and never prompts. Don't reintroduce
   `-o`. (Alpine is unaffected: its inittab already uses `login -f root`.)
+- **Data disk is formatted at most once, and the fstab entry is build-time.**
+  `ensure_data_disk` (in `cmd_run`) only `mkfs`-es an *empty* image, so reboots
+  never wipe data; turning `DATA_DISK_FORMAT` on for an already-raw image works
+  only if `blkid` is available to confirm it's empty (else delete the image to
+  reformat). The auto-mount fstab line is baked by `configure_common` at build
+  time gated on `DATA_DISK_FORMAT`, so flipping the flag needs a rebuild to take
+  effect in-guest. An unformatted disk is deliberately *not* in fstab. A
+  `DATA_DISK` placed under `build/` is wiped by `clean --all`; put it elsewhere
+  to persist.
 - **fakeroot state must span the whole build.** Phase 1 and Phase 3 must use the
   same `-s`/`-i` state file, or the image loses `root:root` ownership.
 - **`mkfs.ext4 -d` drops setuid/setgid bits.** Acceptable here because the guest

@@ -47,6 +47,9 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 # Run a command as root (no-op if already root, else via sudo).
 as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
+# Interpret a boolean-ish config value (1/true/yes/on/y, any case).
+is_true() { case "$(printf %s "${1:-}" | tr A-Z a-z)" in 1|true|yes|on|y) return 0 ;; *) return 1 ;; esac; }
+
 # =====================================================================
 # setup — fetch the Firecracker binary and the guest kernel
 # =====================================================================
@@ -164,6 +167,7 @@ build_alpine() {
   info "installing Alpine packages into rootfs (rootless)"
   ROOT_PASSWORD="$ROOT_PASSWORD" GUEST_HOSTNAME="$GUEST_HOSTNAME" \
   GUEST_DNS="$GUEST_DNS" SSH_PUBKEY="$SSH_PUBKEY" \
+  DATA_DISK="$DATA_DISK" DATA_DISK_FORMAT="$DATA_DISK_FORMAT" DATA_DISK_MOUNT="$DATA_DISK_MOUNT" \
   STAGING="$STAGING" APK_STATIC="$APK_STATIC" REPO="$repo" ARCH="$ARCH" \
   PKGS="alpine-base openrc openssh $ROOTFS_PACKAGES" \
   fakeroot -s "$FAKEROOT_STATE" -- bash "$SCRIPT_DIR/fcvm" __alpine_inside
@@ -187,6 +191,7 @@ build_ubuntu() {
   info "extracting + configuring Ubuntu rootfs (rootless)"
   ROOT_PASSWORD="$ROOT_PASSWORD" GUEST_HOSTNAME="$GUEST_HOSTNAME" \
   GUEST_DNS="$GUEST_DNS" SSH_PUBKEY="$SSH_PUBKEY" \
+  DATA_DISK="$DATA_DISK" DATA_DISK_FORMAT="$DATA_DISK_FORMAT" DATA_DISK_MOUNT="$DATA_DISK_MOUNT" \
   STAGING="$STAGING" SQUASHFS="$UBUNTU_SQUASHFS" \
   fakeroot -s "$FAKEROOT_STATE" -- bash "$SCRIPT_DIR/fcvm" __ubuntu_inside
 
@@ -227,6 +232,17 @@ EOF
     chmod 600 root/.ssh/authorized_keys
     step "injected ssh key: $(basename "$SSH_PUBKEY")"
   fi
+
+  # Optional data disk auto-mount (/dev/vdb). Only when a disk is configured AND
+  # formatting was requested — an unformatted disk must not be in fstab or the
+  # boot-time mount would fail. The image + ext4 are made on the host by
+  # ensure_data_disk; here we just create the mountpoint and the fstab entry
+  # (nofail + pass 0 so a missing/unattached disk never blocks or fscks boot).
+  if [ -n "$DATA_DISK" ] && is_true "$DATA_DISK_FORMAT"; then
+    mkdir -p "${DATA_DISK_MOUNT#/}"
+    printf '/dev/vdb  %s  ext4  rw,relatime,nofail  0 0\n' "$DATA_DISK_MOUNT" >> etc/fstab
+    step "data disk will auto-mount at $DATA_DISK_MOUNT (/dev/vdb)"
+  fi
 }
 
 # Internal: runs inside the fakeroot session from build_alpine. Not for direct use.
@@ -256,7 +272,7 @@ EOF
   # Enable the services needed for a clean, networked boot.
   local svc
   for svc in devfs dmesg;                                 do ln -sf "/etc/init.d/$svc" "etc/runlevels/sysinit/$svc"; done
-  for svc in bootmisc hostname sysctl modules seedrng syslog; do ln -sf "/etc/init.d/$svc" "etc/runlevels/boot/$svc"; done
+  for svc in bootmisc hostname sysctl modules seedrng syslog localmount; do ln -sf "/etc/init.d/$svc" "etc/runlevels/boot/$svc"; done
   for svc in sshd local;                                  do ln -sf "/etc/init.d/$svc" "etc/runlevels/default/$svc"; done
   for svc in killprocs mount-ro savecache;                do ln -sf "/etc/init.d/$svc" "etc/runlevels/shutdown/$svc"; done
 
@@ -386,6 +402,38 @@ EOF
   echo "$bits"
 }
 
+# Ensure the optional data disk image exists on the host (and is ext4-formatted
+# when DATA_DISK_FORMAT is set). No-op unless DATA_DISK is configured. Creating
+# the image is a host concern; the in-guest mount is baked at build time by
+# configure_common. We only ever format an *empty* image, so a reboot never
+# clobbers data already on the disk.
+ensure_data_disk() {
+  [ -n "$DATA_DISK" ] || return 0
+  local created=no
+  if [ ! -f "$DATA_DISK" ]; then
+    need truncate
+    info "creating data disk (${DATA_DISK_SIZE_MIB} MiB) -> $DATA_DISK"
+    mkdir -p "$(dirname "$DATA_DISK")"
+    truncate -s "${DATA_DISK_SIZE_MIB}M" "$DATA_DISK"
+    created=yes
+  fi
+  if is_true "$DATA_DISK_FORMAT"; then
+    if [ "$created" = yes ]; then
+      need mkfs.ext4
+      info "formatting data disk ext4"
+      mkfs.ext4 -q -F -L data "$DATA_DISK"
+    elif command -v blkid >/dev/null 2>&1 \
+         && [ -z "$(blkid -o value -s TYPE "$DATA_DISK" 2>/dev/null || true)" ]; then
+      # Pre-existing image with no filesystem (e.g. created raw, flag now on).
+      need mkfs.ext4
+      info "formatting data disk ext4 (no existing filesystem)"
+      mkfs.ext4 -q -F -L data "$DATA_DISK"
+    else
+      step "data disk present; leaving existing contents untouched"
+    fi
+  fi
+}
+
 # =====================================================================
 # run — generate the VM config and boot, attaching the serial console
 # =====================================================================
@@ -433,6 +481,18 @@ EOF
 )
   fi
 
+  # Optional data disk: create/format the image, then attach it as the second
+  # drive so the guest sees it as /dev/vdb (rootfs stays first == /dev/vda).
+  ensure_data_disk
+  local data_json=""
+  if [ -n "$DATA_DISK" ] && [ -f "$DATA_DISK" ]; then
+    data_json=$(cat <<EOF
+,
+    { "drive_id": "data", "path_on_host": "$DATA_DISK", "is_root_device": false, "is_read_only": false }
+EOF
+)
+  fi
+
   cat > "$VM_CONFIG" <<EOF
 {
   "boot-source": {
@@ -440,14 +500,14 @@ EOF
     "boot_args": "$boot_args"
   },
   "drives": [
-    { "drive_id": "rootfs", "path_on_host": "$ROOTFS", "is_root_device": true, "is_read_only": false }
+    { "drive_id": "rootfs", "path_on_host": "$ROOTFS", "is_root_device": true, "is_read_only": false }$data_json
   ],
   "machine-config": { "vcpu_count": $VCPUS, "mem_size_mib": $MEM_MIB }$net_json
 }
 EOF
 
   rm -f "$FC_SOCK"
-  info "booting microVM (${VCPUS} vCPU, ${MEM_MIB} MiB, net=$with_net)"
+  info "booting microVM (${VCPUS} vCPU, ${MEM_MIB} MiB, net=$with_net$([ -n "$data_json" ] && echo ", +data /dev/vdb"))"
   step "console attached — log in is automatic; type 'poweroff' to shut down"
   echo >&2
   # --no-api boots straight from the config file; serial console = this terminal.
@@ -473,6 +533,15 @@ cmd_status() {
   printf "Kernel      : %s\n" "$([ -f "$KERNEL" ] && echo "$KERNEL" || echo 'missing (./fcvm setup)')"
   printf "Rootfs      : %s\n" "$([ -f "$ROOTFS" ] && du -h "$ROOTFS" | cut -f1 | xargs -I{} echo "$ROOTFS ({})" || echo 'missing (./fcvm build)')"
   printf "SSH key     : %s\n" "$([ -f "$SSH_KEY" ] && echo "$SSH_KEY" || echo "${SSH_PUBKEY:-none (generated at build)}")"
+  local data="disabled"
+  if [ -n "$DATA_DISK" ]; then
+    if [ -f "$DATA_DISK" ]; then
+      data="$DATA_DISK ($(du -h --apparent-size "$DATA_DISK" | cut -f1)$(is_true "$DATA_DISK_FORMAT" && echo ", ext4 -> $DATA_DISK_MOUNT" || echo ", raw /dev/vdb"))"
+    else
+      data="$DATA_DISK (created on run)"
+    fi
+  fi
+  printf "Data disk   : %s\n" "$data"
   printf "Tap %-7s : %s\n" "$TAP_DEV" "$(ip link show "$TAP_DEV" >/dev/null 2>&1 && echo "up — guest $GUEST_IP" || echo 'down (./fcvm net up)')"
 }
 
