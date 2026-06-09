@@ -8,9 +8,10 @@
 #   build   build the Alpine rootfs ext4 image (rootless, via apk.static+fakeroot)
 #           (--mount: bake auto-mount of the data disk at /dev/vdb)
 #   net     up|down  create/destroy the host tap device + NAT (needs sudo)
-#   run     boot the microVM and attach to its serial console
+#   run     boot the microVM detached (--console attaches the serial console)
 #   ssh     ssh into a running guest
-#   up      one-shot: setup + build + net up + run (accepts --data-disk/--mount)
+#   stop    stop the detached microVM
+#   up      one-shot: setup + build + net up + run (accepts --data-disk/--mount/--console)
 #   status  show what exists and whether the network is configured
 #   clean   remove build artifacts (add --all to also drop downloads)
 #
@@ -34,6 +35,8 @@ APK_STATIC="$BUILD_DIR/apk.static"
 UBUNTU_SQUASHFS="$BUILD_DIR/ubuntu-${UBUNTU_RELEASE}.squashfs"
 VM_CONFIG="$BUILD_DIR/vm-config.json"
 FC_SOCK="$BUILD_DIR/firecracker.sock"
+FC_PID="$BUILD_DIR/firecracker.pid"   # detached run: tracks the VM process
+FC_LOG="$BUILD_DIR/firecracker.log"   # detached run: guest serial console log
 STAGING="$BUILD_DIR/rootfs"
 FAKEROOT_STATE="$BUILD_DIR/.fakeroot.state"
 
@@ -51,6 +54,14 @@ as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
 # Interpret a boolean-ish config value (1/true/yes/on/y, any case).
 is_true() { case "$(printf %s "${1:-}" | tr A-Z a-z)" in 1|true|yes|on|y) return 0 ;; *) return 1 ;; esac; }
+
+# Print the PID of a running detached VM and return 0; return 1 if none alive.
+vm_pid() {
+  [ -f "$FC_PID" ] || return 1
+  local pid; pid="$(cat "$FC_PID" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && { printf '%s\n' "$pid"; return 0; }
+  return 1
+}
 
 # =====================================================================
 # setup — fetch the Firecracker binary and the guest kernel
@@ -445,14 +456,16 @@ create_data_disk() {
 }
 
 # =====================================================================
-# run — generate the VM config and boot, attaching the serial console
+# run — generate the VM config and boot. Detached by default (the shell
+# returns; console -> log file); --console attaches the serial console instead.
 # =====================================================================
 cmd_run() {
-  local with_net=auto
+  local with_net=auto console=no
   while [ $# -gt 0 ]; do
     case "$1" in
-      --no-net) with_net=no ;;
-      --net)    with_net=yes ;;
+      --no-net)     with_net=no ;;
+      --net)        with_net=yes ;;
+      --console|-c) console=yes ;;
       *) die "unknown run option: $1" ;;
     esac; shift
   done
@@ -460,6 +473,11 @@ cmd_run() {
   [ -x "$FC_BIN" ] || die "firecracker missing — run: ./fcvm setup"
   [ -f "$KERNEL" ] || die "kernel missing — run: ./fcvm setup"
   [ -f "$ROOTFS" ] || die "rootfs missing — run: ./fcvm build"
+
+  local running
+  if running="$(vm_pid)"; then
+    die "a VM is already running (pid $running) — stop it first: ./fcvm stop"
+  fi
 
   # Decide networking: default to enabled iff the tap device exists.
   if [ "$with_net" = auto ]; then
@@ -517,11 +535,33 @@ EOF
 EOF
 
   rm -f "$FC_SOCK"
-  info "booting microVM (${VCPUS} vCPU, ${MEM_MIB} MiB, net=$with_net$([ -n "$data_json" ] && echo ", +data /dev/vdb"))"
-  step "console attached — log in is automatic; type 'poweroff' to shut down"
-  echo >&2
-  # --no-api boots straight from the config file; serial console = this terminal.
-  exec "$FC_BIN" --no-api --config-file "$VM_CONFIG"
+  local dd=""
+  [ -n "$data_json" ] && dd=", +data /dev/vdb"
+
+  if [ "$console" = yes ]; then
+    info "booting microVM (${VCPUS} vCPU, ${MEM_MIB} MiB, net=$with_net$dd) — console attached"
+    step "log in is automatic; type 'poweroff' to shut down"
+    echo >&2
+    # --no-api boots straight from the config file; serial console = this terminal.
+    exec "$FC_BIN" --no-api --config-file "$VM_CONFIG"
+  fi
+
+  # Default: start detached so the shell returns. The guest serial console is
+  # wired to a log file (no terminal), and the PID is tracked for stop/status.
+  info "booting microVM (${VCPUS} vCPU, ${MEM_MIB} MiB, net=$with_net$dd) — detached"
+  nohup "$FC_BIN" --no-api --config-file "$VM_CONFIG" </dev/null >"$FC_LOG" 2>&1 &
+  local pid=$!
+  disown 2>/dev/null || true
+  printf '%s\n' "$pid" > "$FC_PID"
+  # Fail fast if it died on startup (bad config, busy tap, …).
+  sleep 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$FC_PID"
+    die "VM exited immediately — see $FC_LOG"
+  fi
+  step "VM started (pid $pid); serial console log -> $FC_LOG"
+  [ "$with_net" = yes ] && step "log in:  ./fcvm ssh"
+  step "stop:   ./fcvm stop    (attach an interactive console: ./fcvm run --console)"
 }
 
 # =====================================================================
@@ -537,6 +577,25 @@ cmd_ssh() {
        -o GlobalKnownHostsFile=/dev/null root@"$GUEST_IP" "$@"
 }
 
+# stop — terminate a detached VM (no-op for a foreground --console run).
+cmd_stop() {
+  local pid
+  if ! pid="$(vm_pid)"; then
+    rm -f "$FC_PID"
+    info "no VM running"
+    return 0
+  fi
+  info "stopping VM (pid $pid)"
+  kill "$pid" 2>/dev/null || true
+  # Give Firecracker a few seconds to exit, then force it.
+  for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "still alive — sending SIGKILL"
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$FC_PID" "$FC_SOCK"
+}
+
 cmd_status() {
   printf "Distro      : %s\n" "$DISTRO$([ "$DISTRO" = ubuntu ] && echo " $UBUNTU_RELEASE" || echo " ($ALPINE_BRANCH)")"
   printf "Firecracker : %s\n" "$([ -x "$FC_BIN" ] && "$FC_BIN" --version 2>/dev/null | head -1 || echo 'not installed (./fcvm setup)')"
@@ -549,25 +608,28 @@ cmd_status() {
   fi
   printf "Data disk   : %s\n" "$data"
   printf "Tap %-7s : %s\n" "$TAP_DEV" "$(ip link show "$TAP_DEV" >/dev/null 2>&1 && echo "up — guest $GUEST_IP" || echo 'down (./fcvm net up)')"
+  printf "VM          : %s\n" "$(vm_pid >/dev/null && echo "running (pid $(cat "$FC_PID")) — console log $FC_LOG" || echo 'not running (./fcvm run)')"
 }
 
 cmd_clean() {
+  vm_pid >/dev/null && cmd_stop
   if [ "${1:-}" = "--all" ]; then
     info "removing entire build/ directory"
     rm -rf "$BUILD_DIR"
   else
     info "removing rootfs + VM state (keeping downloads)"
-    rm -rf "$ROOTFS" "$STAGING" "$VM_CONFIG" "$FC_SOCK" "$FAKEROOT_STATE"
+    rm -rf "$ROOTFS" "$STAGING" "$VM_CONFIG" "$FC_SOCK" "$FAKEROOT_STATE" "$FC_PID" "$FC_LOG"
   fi
 }
 
 cmd_up() {
-  local data_disk=no mount=no
+  local data_disk=no mount=no console=no
   while [ $# -gt 0 ]; do
     case "$1" in
-      --data-disk) data_disk=yes ;;
-      --mount)     mount=yes ;;
-      *) die "unknown up option: $1 (try --data-disk and/or --mount)" ;;
+      --data-disk)  data_disk=yes ;;
+      --mount)      mount=yes ;;
+      --console|-c) console=yes ;;
+      *) die "unknown up option: $1 (try --data-disk, --mount and/or --console)" ;;
     esac; shift
   done
 
@@ -580,7 +642,7 @@ cmd_up() {
     cmd_build
   fi
   net_up
-  cmd_run
+  if [ "$console" = yes ]; then cmd_run --console; else cmd_run; fi
 }
 
 usage() {
@@ -596,11 +658,14 @@ COMMANDS
   build [--mount]            Build the guest rootfs ext4 image (rootless);
                              --mount bakes auto-mount of the data disk (/dev/vdb)
   net up|down                Create/destroy the host tap device + NAT (uses sudo)
-  run [--no-net]             Boot the VM and attach to its serial console
+  run [--no-net] [--console] Boot the VM detached (returns to the shell);
+                             --console attaches the serial console instead
                              (auto-attaches the data disk as /dev/vdb if present)
   ssh [cmd...]               SSH into the running guest as root
-  up [--data-disk] [--mount] One-shot: setup + build + net up + run
-  status                     Show artifact / network state
+  stop                       Stop the detached VM
+  up [--data-disk] [--mount] [--console]
+                             One-shot: setup + build + net up + run
+  status                     Show artifact / network / VM state
   clean [--all]              Remove rootfs+VM state (--all also removes downloads)
   help                       Show this help
 
@@ -619,7 +684,8 @@ The two rootfs images coexist (build/alpine.ext4, build/ubuntu.ext4); each
 command acts on whichever DISTRO is selected.
 
 QUICK START
-  ./fcvm up                # do everything and drop into the guest console
+  ./fcvm up                # do everything; VM starts detached, then: ./fcvm ssh
+  ./fcvm up --console      # ...or boot straight into the guest serial console
   # ...or step by step:
   ./fcvm setup && ./fcvm build && ./fcvm net up && ./fcvm run
 
@@ -634,6 +700,7 @@ case "${1:-help}" in
   net)           shift; cmd_net "$@" ;;
   run)           shift; cmd_run "$@" ;;
   ssh)           shift; cmd_ssh "$@" ;;
+  stop)          shift; cmd_stop "$@" ;;
   up)            shift; cmd_up "$@" ;;
   status)        shift; cmd_status "$@" ;;
   clean)         shift; cmd_clean "$@" ;;
