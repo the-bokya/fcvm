@@ -52,6 +52,14 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
 # Run a command as root (no-op if already root, else via sudo).
 as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
+# When invoked via sudo, hand ownership of $@ back to the invoking user, so
+# artifacts created as root (e.g. the ssh key-pair) stay usable unprivileged.
+# No-op when not under sudo. Tolerates missing paths.
+chown_invoker() {
+  [ -n "${SUDO_UID:-}" ] || return 0
+  chown "${SUDO_UID}:${SUDO_GID:-$SUDO_UID}" "$@" 2>/dev/null || true
+}
+
 # Interpret a boolean-ish config value (1/true/yes/on/y, any case).
 is_true() { case "$(printf %s "${1:-}" | tr A-Z a-z)" in 1|true|yes|on|y) return 0 ;; *) return 1 ;; esac; }
 
@@ -171,6 +179,9 @@ ensure_ssh_key() {
     rm -f "$SSH_KEY" "$SSH_KEY.pub"
     ssh-keygen -q -t ed25519 -N '' -C "fcvm@$GUEST_HOSTNAME" -f "$SSH_KEY"
   fi
+  # Under sudo the key-pair is created root:root; give it back so an unprivileged
+  # `fcvm ssh` can still read the private half.
+  chown_invoker "$SSH_KEY" "$SSH_KEY.pub"
 }
 
 build_alpine() {
