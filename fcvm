@@ -3,12 +3,14 @@
 # fcvm — end-to-end driver for running an Alpine Linux microVM on Firecracker.
 #
 # Subcommands (run `./fcvm help` for details):
-#   setup   download the Firecracker binary + guest kernel
+#   setup   download the Firecracker binary + guest kernel (--data-disk: also
+#           create + ext4-format a host data-disk image)
 #   build   build the Alpine rootfs ext4 image (rootless, via apk.static+fakeroot)
+#           (--mount: bake auto-mount of the data disk at /dev/vdb)
 #   net     up|down  create/destroy the host tap device + NAT (needs sudo)
 #   run     boot the microVM and attach to its serial console
 #   ssh     ssh into a running guest
-#   up      one-shot: setup + build + net up + run
+#   up      one-shot: setup + build + net up + run (accepts --data-disk/--mount)
 #   status  show what exists and whether the network is configured
 #   clean   remove build artifacts (add --all to also drop downloads)
 #
@@ -54,6 +56,14 @@ is_true() { case "$(printf %s "${1:-}" | tr A-Z a-z)" in 1|true|yes|on|y) return
 # setup — fetch the Firecracker binary and the guest kernel
 # =====================================================================
 cmd_setup() {
+  local make_data_disk=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --data-disk) make_data_disk=yes ;;
+      *) die "unknown setup option: $1 (try --data-disk)" ;;
+    esac; shift
+  done
+
   need curl; need tar
   mkdir -p "$BUILD_DIR"
 
@@ -88,6 +98,10 @@ cmd_setup() {
     curl -fL# -o "$KERNEL" \
       "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FC_CI_VERSION}/${ARCH}/vmlinux-${KERNEL_VERSION}"
   fi
+
+  # ---- optional data disk (--data-disk) ----
+  [ "$make_data_disk" = yes ] && create_data_disk
+
   info "setup complete"
 }
 
@@ -97,6 +111,14 @@ cmd_setup() {
 #   DISTRO=ubuntu -> Firecracker's official Ubuntu image, squashfs -> ext4
 # =====================================================================
 cmd_build() {
+  local mount_data=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mount) mount_data=yes ;;
+      *) die "unknown build option: $1 (try --mount)" ;;
+    esac; shift
+  done
+
   need curl; need fakeroot; need mkfs.ext4
   mkdir -p "$BUILD_DIR"
   # Resolve the ssh key to bake in: an explicit SSH_PUBKEY wins; otherwise
@@ -105,8 +127,8 @@ cmd_build() {
     SSH_PUBKEY="$SSH_KEY.pub"
   fi
   case "$DISTRO" in
-    alpine) build_alpine ;;
-    ubuntu) build_ubuntu ;;
+    alpine) build_alpine "$mount_data" ;;
+    ubuntu) build_ubuntu "$mount_data" ;;
     *) die "unknown DISTRO '$DISTRO' (use alpine or ubuntu)" ;;
   esac
 }
@@ -141,6 +163,7 @@ ensure_ssh_key() {
 }
 
 build_alpine() {
+  local mount_data="${1:-no}"
   need tar
   local repo="$ALPINE_MIRROR/$ALPINE_BRANCH"
 
@@ -167,7 +190,7 @@ build_alpine() {
   info "installing Alpine packages into rootfs (rootless)"
   ROOT_PASSWORD="$ROOT_PASSWORD" GUEST_HOSTNAME="$GUEST_HOSTNAME" \
   GUEST_DNS="$GUEST_DNS" SSH_PUBKEY="$SSH_PUBKEY" \
-  DATA_DISK="$DATA_DISK" DATA_DISK_FORMAT="$DATA_DISK_FORMAT" DATA_DISK_MOUNT="$DATA_DISK_MOUNT" \
+  MOUNT_DATA_DISK="$mount_data" DATA_DISK_MOUNT="$DATA_DISK_MOUNT" \
   STAGING="$STAGING" APK_STATIC="$APK_STATIC" REPO="$repo" ARCH="$ARCH" \
   PKGS="alpine-base openrc openssh $ROOTFS_PACKAGES" \
   fakeroot -s "$FAKEROOT_STATE" -- bash "$SCRIPT_DIR/fcvm" __alpine_inside
@@ -176,6 +199,7 @@ build_alpine() {
 }
 
 build_ubuntu() {
+  local mount_data="${1:-no}"
   need unsquashfs
   # ---- download Firecracker's official Ubuntu image (cached) ----
   if [ ! -f "$UBUNTU_SQUASHFS" ]; then
@@ -191,7 +215,7 @@ build_ubuntu() {
   info "extracting + configuring Ubuntu rootfs (rootless)"
   ROOT_PASSWORD="$ROOT_PASSWORD" GUEST_HOSTNAME="$GUEST_HOSTNAME" \
   GUEST_DNS="$GUEST_DNS" SSH_PUBKEY="$SSH_PUBKEY" \
-  DATA_DISK="$DATA_DISK" DATA_DISK_FORMAT="$DATA_DISK_FORMAT" DATA_DISK_MOUNT="$DATA_DISK_MOUNT" \
+  MOUNT_DATA_DISK="$mount_data" DATA_DISK_MOUNT="$DATA_DISK_MOUNT" \
   STAGING="$STAGING" SQUASHFS="$UBUNTU_SQUASHFS" \
   fakeroot -s "$FAKEROOT_STATE" -- bash "$SCRIPT_DIR/fcvm" __ubuntu_inside
 
@@ -233,12 +257,11 @@ EOF
     step "injected ssh key: $(basename "$SSH_PUBKEY")"
   fi
 
-  # Optional data disk auto-mount (/dev/vdb). Only when a disk is configured AND
-  # formatting was requested — an unformatted disk must not be in fstab or the
-  # boot-time mount would fail. The image + ext4 are made on the host by
-  # ensure_data_disk; here we just create the mountpoint and the fstab entry
-  # (nofail + pass 0 so a missing/unattached disk never blocks or fscks boot).
-  if [ -n "$DATA_DISK" ] && is_true "$DATA_DISK_FORMAT"; then
+  # Optional data disk auto-mount (/dev/vdb), enabled by `fcvm build --mount`.
+  # We just create the mountpoint and the fstab entry (nofail + pass 0 so a
+  # missing/unattached disk never blocks or fscks boot). The image + ext4 are
+  # made on the host by `fcvm setup --data-disk` (create_data_disk).
+  if is_true "${MOUNT_DATA_DISK:-}"; then
     mkdir -p "${DATA_DISK_MOUNT#/}"
     printf '/dev/vdb  %s  ext4  rw,relatime,nofail  0 0\n' "$DATA_DISK_MOUNT" >> etc/fstab
     step "data disk will auto-mount at $DATA_DISK_MOUNT (/dev/vdb)"
@@ -402,36 +425,23 @@ EOF
   echo "$bits"
 }
 
-# Ensure the optional data disk image exists on the host (and is ext4-formatted
-# when DATA_DISK_FORMAT is set). No-op unless DATA_DISK is configured. Creating
-# the image is a host concern; the in-guest mount is baked at build time by
-# configure_common. We only ever format an *empty* image, so a reboot never
-# clobbers data already on the disk.
-ensure_data_disk() {
-  [ -n "$DATA_DISK" ] || return 0
-  local created=no
-  if [ ! -f "$DATA_DISK" ]; then
-    need truncate
-    info "creating data disk (${DATA_DISK_SIZE_MIB} MiB) -> $DATA_DISK"
-    mkdir -p "$(dirname "$DATA_DISK")"
-    truncate -s "${DATA_DISK_SIZE_MIB}M" "$DATA_DISK"
-    created=yes
+# Create the optional data-disk image on the host and ext4-format it. Triggered
+# by `fcvm setup --data-disk` (or `up --data-disk`). Idempotent: an existing
+# image is left untouched, so re-running setup never clobbers data already on
+# the disk. The image is attached as /dev/vdb at run time (cmd_run), and with
+# `build --mount` the guest auto-mounts it (fstab, baked by configure_common).
+create_data_disk() {
+  local disk="$DATA_DISK_PATH"
+  if [ -f "$disk" ]; then
+    step "data disk already present: $disk ($(du -h --apparent-size "$disk" | cut -f1)); leaving it untouched"
+    return 0
   fi
-  if is_true "$DATA_DISK_FORMAT"; then
-    if [ "$created" = yes ]; then
-      need mkfs.ext4
-      info "formatting data disk ext4"
-      mkfs.ext4 -q -F -L data "$DATA_DISK"
-    elif command -v blkid >/dev/null 2>&1 \
-         && [ -z "$(blkid -o value -s TYPE "$DATA_DISK" 2>/dev/null || true)" ]; then
-      # Pre-existing image with no filesystem (e.g. created raw, flag now on).
-      need mkfs.ext4
-      info "formatting data disk ext4 (no existing filesystem)"
-      mkfs.ext4 -q -F -L data "$DATA_DISK"
-    else
-      step "data disk present; leaving existing contents untouched"
-    fi
-  fi
+  need truncate; need mkfs.ext4
+  info "creating data disk (${DATA_DISK_SIZE_MIB} MiB) -> $disk"
+  mkdir -p "$(dirname "$disk")"
+  truncate -s "${DATA_DISK_SIZE_MIB}M" "$disk"
+  info "formatting data disk ext4"
+  mkfs.ext4 -q -F -L data "$disk"
 }
 
 # =====================================================================
@@ -481,14 +491,14 @@ EOF
 )
   fi
 
-  # Optional data disk: create/format the image, then attach it as the second
-  # drive so the guest sees it as /dev/vdb (rootfs stays first == /dev/vda).
-  ensure_data_disk
+  # Optional data disk: attach it as the second drive (the guest sees it as
+  # /dev/vdb; rootfs stays first == /dev/vda) whenever the image exists. The
+  # image is created by `fcvm setup --data-disk`; run just auto-attaches it.
   local data_json=""
-  if [ -n "$DATA_DISK" ] && [ -f "$DATA_DISK" ]; then
+  if [ -f "$DATA_DISK_PATH" ]; then
     data_json=$(cat <<EOF
 ,
-    { "drive_id": "data", "path_on_host": "$DATA_DISK", "is_root_device": false, "is_read_only": false }
+    { "drive_id": "data", "path_on_host": "$DATA_DISK_PATH", "is_root_device": false, "is_read_only": false }
 EOF
 )
   fi
@@ -533,13 +543,9 @@ cmd_status() {
   printf "Kernel      : %s\n" "$([ -f "$KERNEL" ] && echo "$KERNEL" || echo 'missing (./fcvm setup)')"
   printf "Rootfs      : %s\n" "$([ -f "$ROOTFS" ] && du -h "$ROOTFS" | cut -f1 | xargs -I{} echo "$ROOTFS ({})" || echo 'missing (./fcvm build)')"
   printf "SSH key     : %s\n" "$([ -f "$SSH_KEY" ] && echo "$SSH_KEY" || echo "${SSH_PUBKEY:-none (generated at build)}")"
-  local data="disabled"
-  if [ -n "$DATA_DISK" ]; then
-    if [ -f "$DATA_DISK" ]; then
-      data="$DATA_DISK ($(du -h --apparent-size "$DATA_DISK" | cut -f1)$(is_true "$DATA_DISK_FORMAT" && echo ", ext4 -> $DATA_DISK_MOUNT" || echo ", raw /dev/vdb"))"
-    else
-      data="$DATA_DISK (created on run)"
-    fi
+  local data="none (./fcvm setup --data-disk)"
+  if [ -f "$DATA_DISK_PATH" ]; then
+    data="$DATA_DISK_PATH ($(du -h --apparent-size "$DATA_DISK_PATH" | cut -f1), ext4 -> /dev/vdb)"
   fi
   printf "Data disk   : %s\n" "$data"
   printf "Tap %-7s : %s\n" "$TAP_DEV" "$(ip link show "$TAP_DEV" >/dev/null 2>&1 && echo "up — guest $GUEST_IP" || echo 'down (./fcvm net up)')"
@@ -556,8 +562,23 @@ cmd_clean() {
 }
 
 cmd_up() {
-  cmd_setup
-  [ -f "$ROOTFS" ] || cmd_build
+  local data_disk=no mount=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --data-disk) data_disk=yes ;;
+      --mount)     mount=yes ;;
+      *) die "unknown up option: $1 (try --data-disk and/or --mount)" ;;
+    esac; shift
+  done
+
+  if [ "$data_disk" = yes ]; then cmd_setup --data-disk; else cmd_setup; fi
+  # --mount bakes the auto-mount into the rootfs, so force a (re)build for it;
+  # otherwise build only when the rootfs is missing.
+  if [ "$mount" = yes ]; then
+    cmd_build --mount
+  elif [ ! -f "$ROOTFS" ]; then
+    cmd_build
+  fi
   net_up
   cmd_run
 }
@@ -570,15 +591,26 @@ USAGE
   ./fcvm <command> [args]
 
 COMMANDS
-  setup            Download the Firecracker binary and guest kernel
-  build            Build the guest rootfs ext4 image (rootless)
-  net up|down      Create/destroy the host tap device + NAT (uses sudo)
-  run [--no-net]   Boot the VM and attach to its serial console
-  ssh [cmd...]     SSH into the running guest as root
-  up               One-shot: setup + build + net up + run
-  status           Show artifact / network state
-  clean [--all]    Remove rootfs+VM state (--all also removes downloads)
-  help             Show this help
+  setup [--data-disk]        Download Firecracker + kernel; --data-disk also
+                             creates + ext4-formats a host data-disk image
+  build [--mount]            Build the guest rootfs ext4 image (rootless);
+                             --mount bakes auto-mount of the data disk (/dev/vdb)
+  net up|down                Create/destroy the host tap device + NAT (uses sudo)
+  run [--no-net]             Boot the VM and attach to its serial console
+                             (auto-attaches the data disk as /dev/vdb if present)
+  ssh [cmd...]               SSH into the running guest as root
+  up [--data-disk] [--mount] One-shot: setup + build + net up + run
+  status                     Show artifact / network state
+  clean [--all]              Remove rootfs+VM state (--all also removes downloads)
+  help                       Show this help
+
+DATA DISK (optional second virtio disk, /dev/vdb)
+  ./fcvm setup --data-disk   # create + ext4-format the image on the host
+  ./fcvm build --mount       # auto-mount it at DATA_DISK_MOUNT in the guest
+  ./fcvm run                 # attaches /dev/vdb automatically if the image exists
+  ./fcvm up --data-disk --mount
+Image path/size/mountpoint are set in ./config.env (DATA_DISK_PATH,
+DATA_DISK_SIZE_MIB, DATA_DISK_MOUNT); the on/off switches are the flags above.
 
 GUEST DISTRO (set DISTRO=alpine | ubuntu; default alpine)
   ./fcvm up                       # Alpine (latest-stable)

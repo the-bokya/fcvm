@@ -13,14 +13,17 @@ is shell, KVM, and downloaded binaries.
 ## Commands
 
 ```sh
-./fcvm setup            # download firecracker binary + guest kernel -> build/
-./fcvm build            # build Alpine rootfs ext4 image (rootless)  -> build/alpine.ext4
-./fcvm net up|down      # host tap fc-tap0 + NAT (the ONLY step needing sudo)
-./fcvm run [--no-net]   # boot VM, attach serial console to this terminal
-./fcvm ssh [cmd…]       # ssh root@<GUEST_IP>
-./fcvm up               # setup + build + net up + run (one-shot)
-./fcvm status           # what exists / network state
-./fcvm clean [--all]    # remove rootfs+VM state; --all also drops downloads
+./fcvm setup [--data-disk]   # download firecracker + kernel -> build/;
+                             #   --data-disk also creates+formats DATA_DISK_PATH
+./fcvm build [--mount]       # build Alpine rootfs ext4 (rootless) -> build/alpine.ext4;
+                             #   --mount bakes data-disk auto-mount (/dev/vdb)
+./fcvm net up|down           # host tap fc-tap0 + NAT (the ONLY step needing sudo)
+./fcvm run [--no-net]        # boot VM, attach serial console (auto-attaches the
+                             #   data disk as /dev/vdb if the image exists)
+./fcvm ssh [cmd…]            # ssh root@<GUEST_IP>
+./fcvm up [--data-disk] [--mount]  # setup + build + net up + run (one-shot)
+./fcvm status                # what exists / network state
+./fcvm clean [--all]         # remove rootfs+VM state; --all also drops downloads
 
 bash -n fcvm            # syntax check after edits
 ```
@@ -91,11 +94,13 @@ Three concerns, each a `cmd_*` function in `fcvm`, all writing to `build/`:
    terminal. Guest networking is done entirely by the **kernel `ip=` cmdline**
    (`ip=GUEST::HOST:MASK::eth0:off`) — there is no in-guest DHCP/network
    service. The network NIC is only added if the host tap exists (or `--net`).
-   An optional **data disk** (`DATA_DISK`) is created/formatted on the host by
-   `ensure_data_disk` and attached as the second drive (`/dev/vdb`); rootfs stays
-   first so it remains `/dev/vda`. It is raw by default; `DATA_DISK_FORMAT=true`
-   ext4-formats it and `configure_common` adds an fstab entry so the guest
-   auto-mounts it at `DATA_DISK_MOUNT`.
+   An optional **data disk** is opt-in via **flags** (not env toggles):
+   `setup --data-disk` creates + ext4-formats the image on the host
+   (`create_data_disk`, at `DATA_DISK_PATH`); `cmd_run` attaches it as the second
+   drive (`/dev/vdb`) whenever that image exists, so rootfs stays first as
+   `/dev/vda`; and `build --mount` makes `configure_common` add an fstab entry so
+   the guest auto-mounts it at `DATA_DISK_MOUNT`. `config.env` only carries the
+   path/size/mountpoint defaults.
 
 `cmd_net` is the only privileged piece: it creates a **persistent, user-owned**
 tap (`ip tuntap … user $USER`) so the unprivileged Firecracker process can open
@@ -121,14 +126,16 @@ this form preserves values exported from the parent process.
   overwrite the `serial-getty@ttyS0` override to `agetty --autologin root`
   (without `-o`), which runs `login -f root` and never prompts. Don't reintroduce
   `-o`. (Alpine is unaffected: its inittab already uses `login -f root`.)
-- **Data disk is formatted at most once, and the fstab entry is build-time.**
-  `ensure_data_disk` (in `cmd_run`) only `mkfs`-es an *empty* image, so reboots
-  never wipe data; turning `DATA_DISK_FORMAT` on for an already-raw image works
-  only if `blkid` is available to confirm it's empty (else delete the image to
-  reformat). The auto-mount fstab line is baked by `configure_common` at build
-  time gated on `DATA_DISK_FORMAT`, so flipping the flag needs a rebuild to take
-  effect in-guest. An unformatted disk is deliberately *not* in fstab. A
-  `DATA_DISK` placed under `build/` is wiped by `clean --all`; put it elsewhere
+- **Data-disk lifecycle is split across three commands, driven by flags.**
+  `setup --data-disk` (`create_data_disk`) creates + ext4-formats the image once
+  and **skips an existing image**, so re-running setup never wipes data — to
+  reformat, delete the image first. `cmd_run` auto-attaches `DATA_DISK_PATH` as
+  `/dev/vdb` purely from file existence (no flag, like the tap auto-detect). The
+  auto-mount fstab line is baked by `configure_common` only under `build --mount`
+  (passed through as `MOUNT_DATA_DISK` into the fakeroot re-invocation), so
+  toggling auto-mount needs a rebuild (`up --mount` forces one). The fstab line
+  uses `nofail`, so a baked mount with no attached disk is harmless. A
+  `DATA_DISK_PATH` under `build/` is wiped by `clean --all`; point it elsewhere
   to persist.
 - **fakeroot state must span the whole build.** Phase 1 and Phase 3 must use the
   same `-s`/`-i` state file, or the image loses `root:root` ownership.
