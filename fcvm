@@ -296,8 +296,13 @@ alpine_build_inside() {
   cd "$STAGING"
 
   step "apk add: $PKGS"
+  # --usermode is required: apk.static is statically linked, so fakeroot's
+  # LD_PRELOAD cannot make it believe it is root; current apk refuses to
+  # --initdb as a non-root uid without it. (Ownership in the final image still
+  # comes out root:root — that is recorded via fakeroot when mkfs.ext4 -d packs
+  # the tree in pack_rootfs, not by apk.)
   "$APK_STATIC" -X "$REPO/main" -X "$REPO/community" \
-    -U --allow-untrusted --root "$STAGING" --arch "$ARCH" --initdb \
+    -U --allow-untrusted --usermode --root "$STAGING" --arch "$ARCH" --initdb \
     add $PKGS >/dev/null
 
   step "configuring Alpine guest (init, network, ssh, accounts)"
