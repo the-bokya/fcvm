@@ -476,12 +476,14 @@ create_data_disk() {
 # returns; console -> log file); --console attaches the serial console instead.
 # =====================================================================
 cmd_run() {
-  local with_net=auto console=no
+  # Note: the flag is attach_console, NOT console — `console` is reused below for
+  # the serial *device* name (ttyS0/ttyAMA0), so the flag must not share it.
+  local with_net=auto attach_console=no
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-net)     with_net=no ;;
       --net)        with_net=yes ;;
-      --console|-c) console=yes ;;
+      --console|-c) attach_console=yes ;;
       *) die "unknown run option: $1" ;;
     esac; shift
   done
@@ -554,7 +556,7 @@ EOF
   local dd=""
   [ -n "$data_json" ] && dd=", +data /dev/vdb"
 
-  if [ "$console" = yes ]; then
+  if [ "$attach_console" = yes ]; then
     info "booting microVM (${VCPUS} vCPU, ${MEM_MIB} MiB, net=$with_net$dd) — console attached"
     step "log in is automatic; type 'poweroff' to shut down"
     echo >&2
