@@ -90,6 +90,29 @@ Set `DISTRO=ubuntu` permanently in `config.env` if you prefer.
 `./fcvm run` enables networking automatically **if** the tap device exists;
 otherwise it boots without a NIC. Force either way with `--net` / `--no-net`.
 
+## Testing
+
+A pure-bash test suite lives in [`tests/`](./tests) — no framework, just shell:
+
+```sh
+./tests/run.sh            # fast tiers: static + unit + cli (no network, no KVM)
+./tests/run.sh all        # also build (network) + smoke (boots a real microVM)
+./tests/run.sh build      # run a single tier
+```
+
+| Tier | Needs | What it checks |
+|---|---|---|
+| `static` | — (shellcheck optional) | `bash -n` syntax + `shellcheck` on the suite |
+| `unit` | — | pure functions, by *sourcing* `fcvm` (`mask2cidr`, `is_true`, `vm_pid`, `configure_common`) |
+| `cli` | — | help/usage, flag validation, missing-artifact guards (black-box) |
+| `build` | network + `fakeroot` + `debugfs` | builds the Alpine rootfs and inspects the ext4 image read-only |
+| `smoke` | `/dev/kvm` + network | boots the microVM, asserts it reaches a root shell and exits cleanly |
+
+The same tiers run on every push/PR via GitHub Actions
+([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)). The heavy tiers
+honor `FCVM_TEST_BUILD_DIR` (a reusable build dir) and shrink the image via
+`ROOTFS_SIZE_MIB` to stay fast.
+
 ## Configuration
 
 All knobs live in [`config.env`](./config.env) and can be overridden per-run via
