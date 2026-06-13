@@ -16,7 +16,7 @@ jobs:
   lint-unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Static + unit + CLI tests
@@ -27,7 +27,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y fakeroot e2fsprogs
       - name: Allow unprivileged user namespaces (apk scriptlets)
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y fakeroot e2fsprogs
       - name: Allow unprivileged user namespaces (apk scriptlets)
