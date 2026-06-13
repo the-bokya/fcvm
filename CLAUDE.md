@@ -28,23 +28,35 @@ is shell, KVM, and downloaded binaries.
 bash -n fcvm            # syntax check after edits
 ```
 
-**Smoke test (the closest thing to a test suite)** — boot the real rootfs
-non-interactively and assert it reaches a root shell and powers off cleanly.
-Input must be *delayed* past boot, because Firecracker wires the guest serial
-console to stdin and anything sent before the login shell is ready is lost:
+**Test suite** — a pure-bash suite lives in `tests/` (no framework), run via
+`tests/run.sh`, in tiers:
 
 ```sh
-( sleep 16; printf 'id\ncat /etc/alpine-release\necho OK\npoweroff\n'; sleep 10 ) \
-  | ./fcvm run --no-net 2>&1 | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep -E 'uid=0|System halted'
+./tests/run.sh            # fast: static (bash -n + shellcheck) + unit + cli
+./tests/run.sh all        # also build (network) + smoke (boots a real microVM)
+./tests/run.sh build      # one tier; build/smoke honor FCVM_TEST_BUILD_DIR
 ```
 
-After changing the rootfs builder, inspect the produced image *without booting*
-using `debugfs` (read-only, no root):
+- `unit` sources `fcvm` to test pure functions — the bottom-of-file dispatch is
+  guarded by `if [ "${BASH_SOURCE[0]}" = "${0}" ]` so sourcing defines functions
+  without running anything (every real invocation still dispatches).
+- `build` builds the Alpine rootfs and inspects the image with `debugfs`
+  (read-only, no boot, no root) — e.g. `debugfs -R 'cat /etc/inittab'
+  build/alpine.ext4` or `debugfs -R 'cat /etc/shadow' … | grep '^root:'`.
+- `smoke` boots the real rootfs non-interactively and asserts it reaches a root
+  shell and exits cleanly. Input must be *delayed* past boot (Firecracker wires
+  the guest serial console to stdin; anything sent before the login shell is
+  ready is lost), and the guest must **`reboot`** (not `poweroff`) so Firecracker
+  exits via the `reboot=k` keyboard-controller path — `poweroff` only halts the
+  guest and leaves Firecracker running. The equivalent one-liner:
+  ```sh
+  ( sleep 16; printf 'id\necho OK\nreboot\n'; sleep 8 ) \
+    | ./fcvm run --no-net --console 2>&1 | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' | grep uid=0
+  ```
 
-```sh
-debugfs -R 'cat /etc/inittab' build/alpine.ext4
-debugfs -R 'cat /etc/shadow'  build/alpine.ext4 | grep '^root:'
-```
+CI runs all tiers on every push/PR (`.github/workflows/ci.yml`): `static`+`unit`
++`cli` on a plain runner, `build` with `fakeroot`/`e2fsprogs`, and `smoke` with
+`/dev/kvm` enabled.
 
 ## Architecture
 
