@@ -19,7 +19,8 @@ set -euo pipefail
 
 # --- locate ourselves & load config ----------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="$SCRIPT_DIR/build"
+# Overridable so the test suite can point at a throwaway dir instead of build/.
+BUILD_DIR="${BUILD_DIR:-$SCRIPT_DIR/build}"
 # shellcheck source=/dev/null
 [ -f "$SCRIPT_DIR/config.env" ] && source "$SCRIPT_DIR/config.env"
 
