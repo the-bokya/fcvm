@@ -713,6 +713,11 @@ EOF
 }
 
 # --- dispatch ---------------------------------------------------------------
+# Only dispatch when executed directly (or via `bash fcvm …`), never when the
+# script is *sourced* — the test suite sources it to unit-test functions in
+# isolation. For every real invocation $0 == BASH_SOURCE[0], so this is a no-op
+# (including the fakeroot re-invocation `bash fcvm __alpine_inside`).
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 case "${1:-help}" in
   setup)         shift; cmd_setup "$@" ;;
   build)         shift; cmd_build "$@" ;;
@@ -728,3 +733,4 @@ case "${1:-help}" in
   help|-h|--help) usage ;;
   *) usage; exit 1 ;;
 esac
+fi
