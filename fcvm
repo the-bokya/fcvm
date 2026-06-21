@@ -423,10 +423,56 @@ net_up() {
     else
       warn "iptables not found; guest will have host connectivity but no internet"
     fi
+    # The iptables ACCEPTs above live in the `ip filter` FORWARD chain, but a
+    # host nft firewall (e.g. Arch's stock /etc/nftables.conf) has its *own*
+    # `inet filter forward` base chain with `policy drop`. nftables evaluates
+    # every base chain on a hook and a drop verdict is terminal, so that chain
+    # silently drops the guest's forwarded packets even though our iptables rule
+    # accepted them — the guest can ssh in (host<->guest is INPUT/OUTPUT, not
+    # forwarded) but cannot reach the internet. Punch an accept into any such
+    # drop-policy forward chain so the guest actually gets out.
+    nft_forward_allow_up "$uplink"
   else
     warn "no default route found; skipping NAT"
   fi
   info "guest will be reachable at $GUEST_IP (host $HOST_IP)"
+}
+
+# A host nft firewall may guard the forward hook with a `policy drop` base chain
+# (Arch's default firewall does). Because nftables runs *every* base chain on a
+# hook and a drop is terminal, the iptables FORWARD ACCEPTs in net_up (a separate
+# base chain) can't rescue the packet — the accept has to go *inside* the
+# drop-policy chain. Add a `comment "fcvm"`-tagged accept pair (guest->uplink and
+# the established reply) to each such chain; net_down removes them by that tag.
+# No-op when nft is absent or no forward chain has a drop policy.
+nft_forward_allow_up() {
+  command -v nft >/dev/null 2>&1 || return 0
+  local uplink="$1"
+  as_root nft list chains 2>/dev/null | awk '
+    $1=="table" { fam=$2; tbl=$3 }
+    $1=="chain" { ch=$2 }
+    /hook forward/ && /policy drop/ { print fam, tbl, ch }
+  ' | while read -r fam tbl ch; do
+    # Idempotent: skip a chain we have already tagged (re-running `net up`).
+    as_root nft list chain "$fam" "$tbl" "$ch" 2>/dev/null | grep -q 'comment "fcvm"' && continue
+    as_root nft insert rule "$fam" "$tbl" "$ch" \
+      iifname "$uplink" oifname "$TAP_DEV" ct state related,established accept comment '"fcvm"'
+    as_root nft insert rule "$fam" "$tbl" "$ch" \
+      iifname "$TAP_DEV" oifname "$uplink" accept comment '"fcvm"'
+    step "nft: allowed guest forwarding in $fam/$tbl/$ch (was policy drop)"
+  done
+}
+
+# Remove every accept we tagged with `comment "fcvm"`, by handle, anywhere.
+nft_forward_allow_down() {
+  command -v nft >/dev/null 2>&1 || return 0
+  as_root nft -a list ruleset 2>/dev/null | awk '
+    $1=="table" { fam=$2; tbl=$3 }
+    $1=="chain" { ch=$2 }
+    /comment "fcvm"/ { for (i=1;i<=NF;i++) if ($i=="handle") print fam, tbl, ch, $(i+1) }
+  ' | while read -r fam tbl ch h; do
+    as_root nft delete rule "$fam" "$tbl" "$ch" handle "$h" 2>/dev/null || true
+  done
 }
 
 net_down() {
@@ -437,6 +483,7 @@ net_down() {
     as_root iptables -D FORWARD -i "$TAP_DEV" -o "$uplink" -j ACCEPT 2>/dev/null || true
     as_root iptables -D FORWARD -i "$uplink" -o "$TAP_DEV" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   fi
+  nft_forward_allow_down
   ip link show "$TAP_DEV" >/dev/null 2>&1 && as_root ip link del "$TAP_DEV" || true
   step "removed $TAP_DEV"
 }
